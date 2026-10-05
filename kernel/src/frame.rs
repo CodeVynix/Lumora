@@ -3,6 +3,8 @@
 use crate::MemoryRegion;
 
 const FRAME_SIZE: u64 = 4096;
+pub const FRAME_SIZE_BYTES: u64 = FRAME_SIZE;
+const LOW_MEMORY_LIMIT: u64 = 0x0010_0000;
 
 pub struct FrameAllocator<'a> {
     regions: &'a [MemoryRegion],
@@ -49,7 +51,8 @@ impl<'a> FrameAllocator<'a> {
         while self.region < self.regions.len() {
             let region = self.regions[self.region];
             if region.usable {
-                let start = (region.start + FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+                let start = region.start.saturating_add(FRAME_SIZE - 1) & !(FRAME_SIZE - 1);
+                let start = start.max(LOW_MEMORY_LIMIT);
                 self.next = start;
                 self.end = region.start.saturating_add(region.length) & !(FRAME_SIZE - 1);
                 self.remaining = self
