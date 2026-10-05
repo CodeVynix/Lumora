@@ -47,18 +47,29 @@ fn build() -> ExitCode {
 }
 
 fn run() -> ExitCode {
+    if build() != ExitCode::SUCCESS {
+        return ExitCode::from(1);
+    }
+    let vars = PathBuf::from("target/OVMF_VARS_4M.fd");
+    if let Err(error) = fs::copy("/usr/share/OVMF/OVMF_VARS_4M.fd", &vars) {
+        eprintln!("failed to copy writable OVMF variables: {error}");
+        return ExitCode::from(1);
+    }
     if !command(
         "qemu-system-x86_64",
         &[
             "-machine",
             "q35",
             "-drive",
-            "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
+            "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "-drive",
+            "if=pflash,format=raw,file=target/OVMF_VARS_4M.fd",
             "-drive",
             "format=raw,file=fat:rw:target/lumora-esp",
+            "-nographic",
             "-serial",
             "stdio",
-            "-display",
+            "-monitor",
             "none",
         ],
     ) {
