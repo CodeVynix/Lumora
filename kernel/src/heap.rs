@@ -7,7 +7,7 @@ pub struct Heap {
 impl Heap {
     pub const fn new() -> Self {
         Self {
-            next: 0xffff_9000_0000_0000,
+            next: 0xffff_8000_4000_0000,
         }
     }
 

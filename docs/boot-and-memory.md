@@ -6,12 +6,18 @@ through the UEFI console and probes the standard UEFI serial protocol. The
 
 The `kernel/` crate contains the early memory-management building blocks:
 
-- `frame` walks UEFI-provided usable memory regions in 4096-byte physical frames.
-- `paging` reserves canonical high-half virtual pages for future four-level page
-  table installation.
+- `boot` exits UEFI boot services and copies the final UEFI memory descriptors
+  into a bounded handoff array. Conventional and released boot-services memory
+  become usable; loader-owned memory remains reserved.
+- `frame` walks those regions in 4096-byte physical frames, reserving low memory
+  for firmware data structures.
+- `paging` allocates and initializes kernel-owned PML4, PDPT, PD, and PT pages,
+  installs an identity map plus a high-half alias, and activates the root with
+  `CR3`. It maps a writable high-half heap page from a physical frame.
 - `heap` provides the small bump allocator used before a general allocator is
-  available. Its unit test checks alignment and non-overlap.
+  available. The kernel writes and reads a test value through the mapped heap
+  page and reports `PASS` or `FAIL` over COM1 during boot.
 
-The kernel entry consumes a memory map and reports the first mapped page, heap
-allocation, and remaining frames. Actual page-table activation and kernel ELF
-handoff remain the next implementation slice of the boot protocol.
+`cargo xtask run` uses `/usr/share/OVMF/OVMF_CODE_4M.fd`, copies
+`/usr/share/OVMF/OVMF_VARS_4M.fd` to `target/OVMF_VARS_4M.fd` for each run, and
+starts QEMU in serial-only (`-nographic`) mode.
