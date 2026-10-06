@@ -1,1 +1,5 @@
 /target/
+
+# Local project guidance and agent configuration.
+PROJECT.md
+.github/
