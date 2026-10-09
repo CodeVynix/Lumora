@@ -56,12 +56,8 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
         serial::log("Lumora Kernel: divide-by-zero test FAIL - divide error returned");
     }
 
-    BootReport {
-        page,
-        allocation,
-        free_frames: allocator.free_frames(),
-        heap_test_passed,
-    }
+    serial::log("Lumora Kernel: boot complete, idling");
+    cpu::halt_forever()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
