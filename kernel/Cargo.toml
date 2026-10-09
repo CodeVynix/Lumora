@@ -6,4 +6,8 @@ edition = "2021"
 [lib]
 crate-type = ["rlib"]
 
+[features]
+# Runs the deliberate divide-by-zero check during boot.
+exception-test = []
+
 [dependencies]

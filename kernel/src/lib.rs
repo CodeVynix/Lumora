@@ -1,7 +1,11 @@
 #![no_std]
 
+pub mod cpu;
 pub mod frame;
+pub mod gdt;
 pub mod heap;
+pub mod idt;
+pub mod interrupts;
 pub mod paging;
 pub mod serial;
 
@@ -36,6 +40,22 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     } else {
         "Lumora Kernel: heap test FAIL"
     });
+
+    gdt::init();
+    idt::init();
+    serial::log("Lumora Kernel: GDT, TSS, and IDT loaded");
+
+    serial::log("Lumora Kernel: breakpoint test starting");
+    interrupts::test_breakpoint();
+    serial::log("Lumora Kernel: breakpoint test PASS - execution continued");
+
+    #[cfg(feature = "exception-test")]
+    {
+        serial::log("Lumora Kernel: divide-by-zero test starting");
+        interrupts::test_divide_error();
+        serial::log("Lumora Kernel: divide-by-zero test FAIL - divide error returned");
+    }
+
     BootReport {
         page,
         allocation,
