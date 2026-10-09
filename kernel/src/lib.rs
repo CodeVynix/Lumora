@@ -57,8 +57,37 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
         serial::log("Lumora Kernel: divide-by-zero test FAIL - divide error returned");
     }
 
+    timer::init();
+    // SAFETY: the IDT is loaded (including the vector 32 timer gate) and the
+    // timer is programmed with only IRQ0 unmasked, so every interrupt that
+    // can arrive has a handler.
+    unsafe {
+        cpu::enable_interrupts();
+    }
+
     serial::log("Lumora Kernel: boot complete, idling");
-    cpu::halt_forever()
+    let mut logged_seconds = 0u64;
+    let mut pass_logged = false;
+    loop {
+        // SAFETY: interrupts are enabled above, so `hlt` sleeps until the
+        // next timer tick instead of stopping the CPU; it touches no memory.
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+        let seconds = timer::ticks() / timer::TICKS_PER_SECOND;
+        while logged_seconds < seconds {
+            logged_seconds += 1;
+            serial::log_args(format_args!(
+                "Lumora Kernel: timer tick {} ({} s)",
+                logged_seconds * timer::TICKS_PER_SECOND,
+                logged_seconds
+            ));
+        }
+        if !pass_logged && timer::ticks() >= 5 * timer::TICKS_PER_SECOND {
+            pass_logged = true;
+            serial::log("Lumora Kernel: timer test PASS");
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

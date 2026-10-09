@@ -4,8 +4,8 @@ use crate::cpu::{self, DescriptorTablePointer};
 use crate::gdt::KERNEL_CODE_SELECTOR;
 use crate::interrupts::{
     breakpoint_stub, divide_error_stub, double_fault_stub, general_protection_stub,
-    page_fault_stub, VECTOR_BREAKPOINT, VECTOR_DIVIDE_ERROR, VECTOR_DOUBLE_FAULT,
-    VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT,
+    page_fault_stub, timer_stub, VECTOR_BREAKPOINT, VECTOR_DIVIDE_ERROR, VECTOR_DOUBLE_FAULT,
+    VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT, VECTOR_TIMER,
 };
 
 /// Vectors the x86_64 architecture reserves in the table.
@@ -17,19 +17,21 @@ const INTERRUPT_GATE: u64 = 0x8E;
 /// Interrupt stack table slot reserved for double faults (Intel SDM Vol. 3, 7.7).
 const DOUBLE_FAULT_IST: u64 = 1;
 
-/// The exceptions Build 1 routes: vector, entry stub, and IST slot.
-const GATES: [(u64, extern "C" fn(), u64); 5] = [
+/// The exceptions and timer interrupt Build 1 routes: vector, entry stub, and
+/// IST slot.
+const GATES: [(u64, extern "C" fn(), u64); 6] = [
     (VECTOR_DIVIDE_ERROR, divide_error_stub, 0),
     (VECTOR_BREAKPOINT, breakpoint_stub, 0),
     (VECTOR_DOUBLE_FAULT, double_fault_stub, DOUBLE_FAULT_IST),
     (VECTOR_GENERAL_PROTECTION, general_protection_stub, 0),
     (VECTOR_PAGE_FAULT, page_fault_stub, 0),
+    (VECTOR_TIMER, timer_stub, 0),
 ];
 
 /// The table loaded by [`init`]; untouched vectors stay not present.
 static mut IDT: [[u64; 2]; GATE_COUNT] = [[0; 2]; GATE_COUNT];
 
-/// Installs the five exception gates and loads the table.
+/// Installs the exception and timer gates and loads the table.
 ///
 /// Call this after [`crate::gdt::init`], because the gates name that table's
 /// kernel code selector.

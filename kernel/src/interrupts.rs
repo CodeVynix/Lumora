@@ -7,6 +7,7 @@
 
 use crate::cpu;
 use crate::serial;
+use crate::timer;
 
 /// Divide error, raised by `div` or `idiv` with a zero divisor.
 pub const VECTOR_DIVIDE_ERROR: u64 = 0;
@@ -18,6 +19,8 @@ pub const VECTOR_DOUBLE_FAULT: u64 = 8;
 pub const VECTOR_GENERAL_PROTECTION: u64 = 13;
 /// Page fault.
 pub const VECTOR_PAGE_FAULT: u64 = 14;
+/// System timer, raised by IRQ0 once the PICs are remapped.
+pub const VECTOR_TIMER: u64 = 32;
 
 /// Divide error pushes no error code, so the stub synthesises a zero one.
 #[unsafe(naked)]
@@ -72,6 +75,18 @@ pub extern "C" fn page_fault_stub() {
         "push {vector}",
         "jmp {common}",
         vector = const VECTOR_PAGE_FAULT,
+        common = sym common_entry,
+    );
+}
+
+/// IRQs push no error code, so the stub synthesises a zero one.
+#[unsafe(naked)]
+pub extern "C" fn timer_stub() {
+    core::arch::naked_asm!(
+        "push 0",
+        "push {vector}",
+        "jmp {common}",
+        vector = const VECTOR_TIMER,
         common = sym common_entry,
     );
 }
@@ -155,7 +170,8 @@ pub struct TrapFrame {
 }
 
 /// Reports the exception in `frame`. A breakpoint returns so the interrupted
-/// code resumes; every other vector is fatal and parks the CPU.
+/// code resumes, and the timer only records a tick; every other vector is
+/// fatal and parks the CPU.
 ///
 /// # Safety
 ///
@@ -168,6 +184,7 @@ pub unsafe extern "C" fn exception_dispatch(frame: *const TrapFrame) {
     let frame = unsafe { &*frame };
     match frame.vector {
         VECTOR_BREAKPOINT => breakpoint_handler(frame),
+        VECTOR_TIMER => timer::tick(),
         _ => fatal_handler(frame),
     }
 }
@@ -201,6 +218,7 @@ const fn exception_name(vector: u64) -> &'static str {
         VECTOR_DOUBLE_FAULT => "Double Fault",
         VECTOR_GENERAL_PROTECTION => "General Protection Fault",
         VECTOR_PAGE_FAULT => "Page Fault",
+        VECTOR_TIMER => "System Timer",
         _ => "Unknown Exception",
     }
 }

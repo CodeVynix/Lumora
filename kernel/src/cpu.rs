@@ -78,6 +78,20 @@ pub unsafe fn disable_interrupts() {
     }
 }
 
+/// Enables maskable interrupts once the IDT and the timer are ready.
+///
+/// # Safety
+///
+/// Every unmasked IRQ must already have a working IDT gate; otherwise the
+/// first tick arrives with nowhere to go and triple-faults the machine.
+pub unsafe fn enable_interrupts() {
+    // SAFETY: the caller guarantees the IDT covers every unmasked vector;
+    // `sti` only sets the interrupt-enable flag.
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Disables interrupts and halts the CPU until the machine is reset.
 pub fn halt_forever() -> ! {
     // SAFETY: `cli` and `hlt` only change CPU state, and no memory is touched
