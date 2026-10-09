@@ -8,6 +8,7 @@ pub mod idt;
 pub mod interrupts;
 pub mod paging;
 pub mod serial;
+pub mod timer;
 
 /// Kernel entry called by the bootloader after the UEFI handoff.
 pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
