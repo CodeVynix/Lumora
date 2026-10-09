@@ -4,30 +4,35 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
-    match env::args().nth(1).as_deref() {
-        Some("build") => build(),
-        Some("run") => run(),
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    let exception_test = arguments
+        .iter()
+        .any(|argument| argument == "exception-test");
+    match arguments.first().map(String::as_str) {
+        Some("build") => build(exception_test),
+        Some("run") => run(exception_test),
         _ => {
-            eprintln!("usage: cargo xtask <build|run>");
+            eprintln!("usage: cargo xtask <build|run> [exception-test]");
             ExitCode::from(2)
         }
     }
 }
 
-fn build() -> ExitCode {
+fn build(exception_test: bool) -> ExitCode {
     if !command("cargo", &["test", "-p", "lumora-kernel"]) {
         return ExitCode::from(1);
     }
-    if !command(
-        "cargo",
-        &[
-            "build",
-            "-p",
-            "lumora-boot",
-            "--target",
-            "x86_64-unknown-uefi",
-        ],
-    ) {
+    let mut boot = vec![
+        "build",
+        "-p",
+        "lumora-boot",
+        "--target",
+        "x86_64-unknown-uefi",
+    ];
+    if exception_test {
+        boot.extend(["--features", "lumora-boot/exception-test"]);
+    }
+    if !command("cargo", &boot) {
         return ExitCode::from(1);
     }
     let out = PathBuf::from("target/lumora-esp/EFI/BOOT");
@@ -42,12 +47,15 @@ fn build() -> ExitCode {
         eprintln!("failed to stage bootloader: {error}");
         return ExitCode::from(1);
     }
+    if exception_test {
+        println!("Lumora build: exception-test feature enabled");
+    }
     println!("Lumora build: staged UEFI image at target/lumora-esp");
     ExitCode::SUCCESS
 }
 
-fn run() -> ExitCode {
-    if build() != ExitCode::SUCCESS {
+fn run(exception_test: bool) -> ExitCode {
+    if build(exception_test) != ExitCode::SUCCESS {
         return ExitCode::from(1);
     }
     let vars = PathBuf::from("target/OVMF_VARS_4M.fd");

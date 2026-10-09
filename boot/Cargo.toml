@@ -9,6 +9,9 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+exception-test = ["lumora-kernel/exception-test"]
+
 [dependencies]
 lumora-kernel = { path = "../kernel" }
 uefi = { version = "0.34", features = ["alloc", "global_allocator"] }
