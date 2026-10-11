@@ -78,6 +78,26 @@ pub unsafe fn disable_interrupts() {
     }
 }
 
+/// Returns true when maskable interrupts are currently enabled.
+///
+/// The context switch reads this so it can leave the interrupt flag exactly
+/// as it found it once the other thread is running.
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: `pushfq` and `pop` only round-trip RFLAGS through `flags`; they
+    // touch no memory and leave the flags unchanged.
+    unsafe {
+        asm!(
+            "pushfq",
+            "pop {flags}",
+            flags = out(reg) flags,
+            options(nomem, preserves_flags),
+        );
+    }
+    // RFLAGS.IF is bit 9 (Intel SDM Vol. 1, section 3.4.3).
+    flags & (1 << 9) != 0
+}
+
 /// Enables maskable interrupts once the IDT and the timer are ready.
 ///
 /// # Safety

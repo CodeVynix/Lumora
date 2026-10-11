@@ -35,18 +35,34 @@ impl PageTable {
         })
     }
 
+    /// Maps one page for the kernel heap.
     pub fn map_heap_page(&mut self, frames: &mut FrameAllocator<'_>) -> Option<u64> {
-        let physical = frames.allocate()?;
+        self.map_heap_range(frames, 1)
+    }
+
+    /// Maps `page_count` consecutive pages for the kernel heap and returns the
+    /// first virtual address. `page_count` must fit in a single page table.
+    pub fn map_heap_range(
+        &mut self,
+        frames: &mut FrameAllocator<'_>,
+        page_count: u64,
+    ) -> Option<u64> {
+        if page_count == 0 || page_count > 512 {
+            return None;
+        }
         let pdpt = frames.allocate()?;
         let pd = frames.allocate()?;
         let pt = frames.allocate()?;
         zero_table(pdpt);
         zero_table(pd);
         zero_table(pt);
+        for index in 0..page_count {
+            let physical = frames.allocate()?;
+            write_entry(pt, index as usize, physical | PRESENT | WRITABLE);
+        }
         write_entry(self.root, 256, pdpt | PRESENT | WRITABLE);
         write_entry(pdpt, 1, pd | PRESENT | WRITABLE);
         write_entry(pd, 0, pt | PRESENT | WRITABLE);
-        write_entry(pt, 0, physical | PRESENT | WRITABLE);
         let virtual_address = self.next_virtual;
         Some(virtual_address)
     }
