@@ -8,7 +8,12 @@ pub mod idt;
 pub mod interrupts;
 pub mod paging;
 pub mod serial;
+pub mod thread;
 pub mod timer;
+
+/// Pages the kernel heap spans: the boot allocations, plus one 16 KiB thread
+/// stack for each of the two test threads.
+const HEAP_PAGES: u64 = 9;
 
 /// Kernel entry called by the bootloader after the UEFI handoff.
 pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
@@ -22,12 +27,18 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
             return BootReport::failed();
         }
     };
-    let page = tables.map_heap_page(&mut allocator);
-    let mut heap = heap::Heap::new();
-    let allocation = page.and_then(|_| heap.allocate(64, 8));
+    let page = tables.map_heap_range(&mut allocator, HEAP_PAGES);
+    let mut heap = match page {
+        Some(base) => heap::Heap::with_pages(base, HEAP_PAGES),
+        None => {
+            serial::log("Lumora Kernel: heap mapping FAIL");
+            return BootReport::failed();
+        }
+    };
+    let allocation = heap.allocate(64, 8);
     let heap_test_passed = allocation.is_some_and(|address| {
-        // SAFETY: the page was mapped writable by `PageTable::map_heap_page`,
-        // and the bump allocator returns an address within that page.
+        // SAFETY: the page was mapped writable by `PageTable::map_heap_range`,
+        // and the bump allocator returns an address within that mapping.
         unsafe {
             let pointer = address as *mut u64;
             pointer.write(0x4c554d4f_52415f31);
@@ -41,6 +52,9 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     } else {
         "Lumora Kernel: heap test FAIL"
     });
+
+    thread::init();
+    thread::register_heap(&mut heap);
 
     gdt::init();
     idt::init();
@@ -66,15 +80,25 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     }
 
     serial::log("Lumora Kernel: boot complete, idling");
+    idle_forever();
+}
+
+/// Idles the boot thread: logs timer ticks, runs the thread test once the
+/// timer has proven itself, then keeps idling and logging ticks.
+fn idle_forever() -> ! {
     let mut logged_seconds = 0u64;
-    let mut pass_logged = false;
+    let mut timer_pass_logged = false;
+    let mut threads_spawned = false;
+    let mut spawned_threads = 0usize;
+    let mut thread_pass_logged = false;
     loop {
-        // SAFETY: interrupts are enabled above, so `hlt` sleeps until the
-        // next timer tick instead of stopping the CPU; it touches no memory.
+        // SAFETY: interrupts are enabled before the kernel reaches this loop,
+        // so `hlt` only waits for the next timer tick; it touches no memory.
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
-        let seconds = timer::ticks() / timer::TICKS_PER_SECOND;
+        let ticks = timer::ticks();
+        let seconds = ticks / timer::TICKS_PER_SECOND;
         while logged_seconds < seconds {
             logged_seconds += 1;
             serial::log_args(format_args!(
@@ -83,10 +107,47 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
                 logged_seconds
             ));
         }
-        if !pass_logged && timer::ticks() >= 5 * timer::TICKS_PER_SECOND {
-            pass_logged = true;
+        if !timer_pass_logged && ticks >= 5 * timer::TICKS_PER_SECOND {
+            timer_pass_logged = true;
             serial::log("Lumora Kernel: timer test PASS");
         }
+        if timer_pass_logged && !threads_spawned {
+            threads_spawned = true;
+            if let (Some(thread_a_id), Some(thread_b_id)) =
+                (thread::spawn(thread_a), thread::spawn(thread_b))
+            {
+                spawned_threads = 2;
+                serial::log_args(format_args!(
+                    "Lumora Kernel: spawned threads A and B as ids {} and {}",
+                    thread_a_id, thread_b_id
+                ));
+            } else {
+                serial::log("Lumora Kernel: thread spawn FAIL");
+            }
+        }
+        if spawned_threads > 0 {
+            thread::yield_now();
+            if !thread_pass_logged && thread::finished_threads() == spawned_threads {
+                thread_pass_logged = true;
+                serial::log("Lumora Kernel: thread test PASS");
+            }
+        }
+    }
+}
+
+/// Body of test thread A: ten steps, yielding after each one.
+fn thread_a() {
+    for step in 1..=10 {
+        serial::log_args(format_args!("thread A: step {}", step));
+        thread::yield_now();
+    }
+}
+
+/// Body of test thread B: ten steps, yielding after each one.
+fn thread_b() {
+    for step in 1..=10 {
+        serial::log_args(format_args!("thread B: step {}", step));
+        thread::yield_now();
     }
 }
 
