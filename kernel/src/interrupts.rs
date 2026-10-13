@@ -231,6 +231,7 @@ fn syscall_handler(frame: &mut TrapFrame) {
             let pointer = frame.rdi;
             let length = frame.rsi;
             if !paging::is_user_range(pointer, length) {
+                serial::log("Lumora Kernel: hostile pointer rejected");
                 frame.rax = u64::MAX;
                 return;
             }
