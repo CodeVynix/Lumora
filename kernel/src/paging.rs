@@ -93,10 +93,15 @@ impl PageTable {
     }
 }
 
-const PRESENT: u64 = 1;
-const WRITABLE: u64 = 1 << 1;
-const USER: u64 = 1 << 2;
+pub(crate) const PRESENT: u64 = 1;
+pub(crate) const WRITABLE: u64 = 1 << 1;
+pub(crate) const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
+
+/// Root of the currently loaded page tables, with flags masked off.
+pub fn current_root() -> u64 {
+    read_cr3() & !0xFFF
+}
 
 /// Returns true when every byte in `[start, start + len)` is present and
 /// user-accessible in the currently loaded page tables.
@@ -161,7 +166,7 @@ fn is_canonical(address: u64) -> bool {
     address >> 47 == 0 || address >> 47 == 0x1FFFF
 }
 
-fn zero_table(physical: u64) {
+pub(crate) fn zero_table(physical: u64) {
     // SAFETY: the frame allocator returns aligned, usable physical frames and
     // the boot identity map makes them writable before and after CR3 changes.
     unsafe {
@@ -169,15 +174,15 @@ fn zero_table(physical: u64) {
     }
 }
 
-fn read_entry(table: u64, index: usize) -> u64 {
-    // SAFETY: `table` is a page-table frame owned by a live `PageTable` and
-    // `index` is bounded to the 512 entries in that frame.
+pub(crate) fn read_entry(table: u64, index: usize) -> u64 {
+    // SAFETY: `table` is a page-table frame from live tables and `index` is
+    // bounded to the 512 entries in that frame.
     unsafe { core::ptr::read((table as *const u64).add(index)) }
 }
 
-fn write_entry(table: u64, index: usize, value: u64) {
-    // SAFETY: `table` is a page-table frame owned by this PageTable and
-    // `index` is bounded to the 512 entries in that frame.
+pub(crate) fn write_entry(table: u64, index: usize, value: u64) {
+    // SAFETY: `table` is a page-table frame owned by live tables under
+    // construction and `index` is bounded to the 512 entries in that frame.
     unsafe {
         core::ptr::write((table as *mut u64).add(index), value);
     }
