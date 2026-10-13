@@ -15,6 +15,15 @@ pub mod timer;
 /// stack for each of the two test threads.
 const HEAP_PAGES: u64 = 9;
 
+/// Steps each preemption-test thread logs before it finishes.
+const PREEMPTION_TEST_STEPS: u32 = 5;
+
+/// Ticks a test thread waits between two of its log lines.
+const PREEMPTION_TEST_PERIOD: u64 = 20;
+
+/// Preemption count that proves the timer switched threads.
+const PREEMPTION_TEST_MINIMUM: u64 = 10;
+
 /// Kernel entry called by the bootloader after the UEFI handoff.
 pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     serial::log("Lumora Kernel: entry");
@@ -83,14 +92,14 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     idle_forever();
 }
 
-/// Idles the boot thread: logs timer ticks, runs the thread test once the
+/// Idles the boot thread: logs timer ticks, runs the preemption test once the
 /// timer has proven itself, then keeps idling and logging ticks.
 fn idle_forever() -> ! {
     let mut logged_seconds = 0u64;
     let mut timer_pass_logged = false;
     let mut threads_spawned = false;
     let mut spawned_threads = 0usize;
-    let mut thread_pass_logged = false;
+    let mut preemption_logged = false;
     loop {
         // SAFETY: interrupts are enabled before the kernel reaches this loop,
         // so `hlt` only waits for the next timer tick; it touches no memory.
@@ -127,27 +136,48 @@ fn idle_forever() -> ! {
         }
         if spawned_threads > 0 {
             thread::yield_now();
-            if !thread_pass_logged && thread::finished_threads() == spawned_threads {
-                thread_pass_logged = true;
-                serial::log("Lumora Kernel: thread test PASS");
+            if !preemption_logged && thread::finished_threads() == spawned_threads {
+                preemption_logged = true;
+                let preemptions = timer::preemptions();
+                serial::log_args(format_args!(
+                    "Lumora Kernel: preemption count {}",
+                    preemptions
+                ));
+                if preemptions >= PREEMPTION_TEST_MINIMUM {
+                    serial::log("Lumora Kernel: preemption test PASS");
+                }
             }
         }
     }
 }
 
-/// Body of test thread A: ten steps, yielding after each one.
+/// Body of test thread A: busy-loops on the tick counter and logs every
+/// twenty ticks. It never yields; only the timer preempts it.
 fn thread_a() {
-    for step in 1..=10 {
-        serial::log_args(format_args!("thread A: step {}", step));
-        thread::yield_now();
+    let mut last_logged = timer::ticks();
+    let mut steps = 0u32;
+    while steps < PREEMPTION_TEST_STEPS {
+        let now = timer::ticks();
+        if now - last_logged >= PREEMPTION_TEST_PERIOD {
+            last_logged = now;
+            steps += 1;
+            serial::log_args(format_args!("thread A: tick {}", now));
+        }
     }
 }
 
-/// Body of test thread B: ten steps, yielding after each one.
+/// Body of test thread B: busy-loops on the tick counter and logs every
+/// twenty ticks. It never yields; only the timer preempts it.
 fn thread_b() {
-    for step in 1..=10 {
-        serial::log_args(format_args!("thread B: step {}", step));
-        thread::yield_now();
+    let mut last_logged = timer::ticks();
+    let mut steps = 0u32;
+    while steps < PREEMPTION_TEST_STEPS {
+        let now = timer::ticks();
+        if now - last_logged >= PREEMPTION_TEST_PERIOD {
+            last_logged = now;
+            steps += 1;
+            serial::log_args(format_args!("thread B: tick {}", now));
+        }
     }
 }
 
