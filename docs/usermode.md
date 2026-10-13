@@ -52,6 +52,12 @@ same way out after logging the fault and the instruction pointer, so the
 privileged-instruction payload is reported and killed while the kernel keeps
 running. Kernel-mode faults still halt as before.
 
-The idle loop runs a writing payload (exit code 0 expected) and then a
-privileged-instruction payload (general-protection kill expected) and logs
-`user mode test PASS` only when both behaved.
+The idle loop runs three payloads and logs `user mode test PASS` only when
+all three behaved: the first exits cleanly (logged as `user payload 1 exited
+cleanly`), the second dies by general-protection fault (logged with the fault
+details and `killing task`), and the third sees every hostile pointer
+rejected. The hostile cases are a supervisor-only heap address with a
+plausible length, a length that wraps the range past the address-space end,
+and a range straddling the end of the user region; each rejection is logged
+as `hostile pointer rejected`, and the payload exits cleanly only when all
+three calls returned the error value without the kernel touching the memory.
