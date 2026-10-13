@@ -10,6 +10,7 @@ pub mod paging;
 pub mod serial;
 pub mod thread;
 pub mod timer;
+pub mod usermode;
 
 /// Pages the kernel heap spans: the boot allocations, plus one 16 KiB thread
 /// stack for each of the two test threads.
@@ -23,6 +24,19 @@ const PREEMPTION_TEST_PERIOD: u64 = 20;
 
 /// Preemption count that proves the timer switched threads.
 const PREEMPTION_TEST_MINIMUM: u64 = 10;
+
+/// Bytes in the ring-3 stack used by the user-mode test payloads.
+const USER_STACK_BYTES: usize = 16 * 1024;
+
+/// Message the first user-mode payload asks the kernel to write to serial.
+static USER_HELLO: &[u8] = b"hello from ring 3";
+
+/// Alignment wrapper so the user stack top stays 16-byte aligned.
+#[repr(C, align(16))]
+struct AlignedUserStack([u8; USER_STACK_BYTES]);
+
+/// Stack the kernel hands to the ring-3 test payloads on entry.
+static mut USER_STACK: AlignedUserStack = AlignedUserStack([0; USER_STACK_BYTES]);
 
 /// Kernel entry called by the bootloader after the UEFI handoff.
 pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
@@ -62,6 +76,10 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
         "Lumora Kernel: heap test FAIL"
     });
 
+    // Ring 3 can only run from user-accessible pages; the low identity map
+    // covers the image the payloads live in.
+    tables.make_identity_user_accessible();
+
     thread::init();
     thread::register_heap(&mut heap);
 
@@ -92,14 +110,15 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     idle_forever();
 }
 
-/// Idles the boot thread: logs timer ticks, runs the preemption test once the
-/// timer has proven itself, then keeps idling and logging ticks.
+/// Idles the boot thread: logs timer ticks, runs the thread tests once the
+/// timer has proven itself, then the user-mode test, then keeps idling.
 fn idle_forever() -> ! {
     let mut logged_seconds = 0u64;
     let mut timer_pass_logged = false;
     let mut threads_spawned = false;
     let mut spawned_threads = 0usize;
     let mut preemption_logged = false;
+    let mut user_test_done = false;
     loop {
         // SAFETY: interrupts are enabled before the kernel reaches this loop,
         // so `hlt` only waits for the next timer tick; it touches no memory.
@@ -147,7 +166,87 @@ fn idle_forever() -> ! {
                     serial::log("Lumora Kernel: preemption test PASS");
                 }
             }
+            if preemption_logged && !user_test_done {
+                user_test_done = true;
+                run_user_mode_test();
+            }
         }
+    }
+}
+
+/// Runs the two ring-3 payloads and logs `user mode test PASS` only when the
+/// first exits cleanly and the second dies by general protection fault.
+fn run_user_mode_test() {
+    serial::log("Lumora Kernel: user mode test starting");
+    // SAFETY: the user segments are loaded, TSS RSP0 points at the ring-0
+    // stack, and the payload plus the user stack sit in user-accessible
+    // pages; no other user task can run while this one does.
+    let write_code = unsafe {
+        usermode::enter_user(
+            user_payload_write as *const () as usize as u64,
+            user_stack_top(),
+            usermode::user_resume_slot(),
+        )
+    };
+    // SAFETY: the syscall exit path abandons its interrupt frame without
+    // restoring flags, so interrupts stay off until re-enabled here.
+    unsafe {
+        cpu::enable_interrupts();
+    }
+    // SAFETY: same ring-3 preconditions as the first payload.
+    let privileged_code = unsafe {
+        usermode::enter_user(
+            user_payload_privileged as *const () as usize as u64,
+            user_stack_top(),
+            usermode::user_resume_slot(),
+        )
+    };
+    // SAFETY: the fault path abandons its interrupt frame the same way the
+    // syscall exit does.
+    unsafe {
+        cpu::enable_interrupts();
+    }
+    if write_code == usermode::USER_EXIT_OK && privileged_code == usermode::USER_EXIT_GP {
+        serial::log("Lumora Kernel: user mode test PASS");
+    } else {
+        serial::log("Lumora Kernel: user mode test FAIL");
+    }
+}
+
+/// Exclusive end of the ring-3 stack handed to the user-mode payloads.
+fn user_stack_top() -> u64 {
+    core::ptr::addr_of!(USER_STACK) as *const u8 as u64 + USER_STACK_BYTES as u64
+}
+
+/// Ring-3 test payload: writes one message with a syscall, then exits.
+fn user_payload_write() {
+    let message = USER_HELLO;
+    // SAFETY: `int 0x80` is the installed syscall gate, which is callable
+    // from ring 3; the pointer and length name the static message above.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") usermode::SYS_WRITE_SERIAL,
+            in("rdi") message.as_ptr() as u64,
+            in("rsi") message.len() as u64,
+            lateout("rax") _,
+        );
+        core::arch::asm!(
+            "int 0x80",
+            in("rax") usermode::SYS_EXIT,
+            in("rdi") usermode::USER_EXIT_OK,
+            options(noreturn),
+        );
+    }
+}
+
+/// Ring-3 test payload: executes a privileged instruction so the kernel
+/// reports the fault and kills the task instead of halting.
+fn user_payload_privileged() {
+    // SAFETY: `hlt` is privileged at CPL 3 with IOPL 0, so it raises exactly
+    // the general protection fault this test expects; it never completes.
+    unsafe {
+        core::arch::asm!("hlt", options(noreturn));
     }
 }
 

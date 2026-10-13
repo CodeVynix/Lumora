@@ -6,8 +6,10 @@
 //! general registers into a [`TrapFrame`], and calls [`exception_dispatch`].
 
 use crate::cpu;
+use crate::paging;
 use crate::serial;
 use crate::timer;
+use crate::usermode;
 
 /// Divide error, raised by `div` or `idiv` with a zero divisor.
 pub const VECTOR_DIVIDE_ERROR: u64 = 0;
@@ -21,6 +23,8 @@ pub const VECTOR_GENERAL_PROTECTION: u64 = 13;
 pub const VECTOR_PAGE_FAULT: u64 = 14;
 /// System timer, raised by IRQ0 once the PICs are remapped.
 pub const VECTOR_TIMER: u64 = 32;
+/// Software-interrupt syscall vector, callable from ring 3.
+pub const VECTOR_SYSCALL: u64 = 0x80;
 
 /// Divide error pushes no error code, so the stub synthesises a zero one.
 #[unsafe(naked)]
@@ -87,6 +91,18 @@ pub extern "C" fn timer_stub() {
         "push {vector}",
         "jmp {common}",
         vector = const VECTOR_TIMER,
+        common = sym common_entry,
+    );
+}
+
+/// Software interrupts push no error code, so the stub synthesises a zero one.
+#[unsafe(naked)]
+pub extern "C" fn syscall_stub() {
+    core::arch::naked_asm!(
+        "push 0",
+        "push {vector}",
+        "jmp {common}",
+        vector = const VECTOR_SYSCALL,
         common = sym common_entry,
     );
 }
@@ -170,21 +186,30 @@ pub struct TrapFrame {
 }
 
 /// Reports the exception in `frame`. A breakpoint returns so the interrupted
-/// code resumes, and the timer only records a tick; every other vector is
-/// fatal and parks the CPU.
+/// code resumes, the timer only records a tick, and a syscall runs its
+/// handler; a general protection fault from user mode kills that task and
+/// resumes the kernel instead of halting. Every other vector is fatal.
 ///
 /// # Safety
 ///
 /// `frame` must point at a [`TrapFrame`] written by the stubs in this module.
 /// They build it from eight-byte pushes on the active stack, so it is always
 /// eight-byte aligned and stays alive until the dispatcher returns.
-pub unsafe extern "C" fn exception_dispatch(frame: *const TrapFrame) {
+pub unsafe extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
     // SAFETY: the stub passes the address of the frame it just built, and the
     // documented preconditions guarantee it is a live, aligned `TrapFrame`.
-    let frame = unsafe { &*frame };
+    let frame = unsafe { &mut *frame };
     match frame.vector {
         VECTOR_BREAKPOINT => breakpoint_handler(frame),
         VECTOR_TIMER => timer::tick(),
+        VECTOR_SYSCALL => syscall_handler(frame),
+        VECTOR_GENERAL_PROTECTION if frame.code_segment & 3 == 3 => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: fatal exception General Protection Fault vector={} error_code=0x{:016x} instruction_pointer=0x{:016x} in user mode; killing task",
+                frame.vector, frame.error_code, frame.instruction_pointer
+            ));
+            usermode::exit_to_kernel(usermode::USER_EXIT_GP, usermode::user_resume_slot());
+        }
         _ => fatal_handler(frame),
     }
 }
@@ -195,6 +220,43 @@ fn breakpoint_handler(frame: &TrapFrame) {
         "Lumora Kernel: Breakpoint vector={} instruction_pointer=0x{:016x} handled, resuming execution",
         frame.vector, frame.instruction_pointer
     ));
+}
+
+/// Runs one syscall from user mode: number in RAX, pointer in RDI, length in
+/// RSI. Returns the result in RAX: bytes written, the exit code path never
+/// returning, or `u64::MAX` for a bad call.
+fn syscall_handler(frame: &mut TrapFrame) {
+    match frame.rax {
+        usermode::SYS_WRITE_SERIAL => {
+            let pointer = frame.rdi;
+            let length = frame.rsi;
+            if !paging::is_user_range(pointer, length) {
+                frame.rax = u64::MAX;
+                return;
+            }
+            // SAFETY: the range check above proved every byte is present and
+            // user-accessible, and single-threaded user tasks cannot remap
+            // memory under the handler.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(pointer as *const u8, length as usize) };
+            match core::str::from_utf8(bytes) {
+                Ok(text) => {
+                    serial::log(text);
+                    frame.rax = length;
+                }
+                Err(_) => {
+                    frame.rax = u64::MAX;
+                }
+            }
+        }
+        usermode::SYS_EXIT => {
+            let code = frame.rdi;
+            usermode::exit_to_kernel(code, usermode::user_resume_slot());
+        }
+        _ => {
+            frame.rax = u64::MAX;
+        }
+    }
 }
 
 /// Logs the fatal exception and halts the CPU until the machine is reset.
@@ -219,6 +281,7 @@ const fn exception_name(vector: u64) -> &'static str {
         VECTOR_GENERAL_PROTECTION => "General Protection Fault",
         VECTOR_PAGE_FAULT => "Page Fault",
         VECTOR_TIMER => "System Timer",
+        VECTOR_SYSCALL => "System Call",
         _ => "Unknown Exception",
     }
 }
