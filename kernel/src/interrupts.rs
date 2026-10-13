@@ -210,6 +210,13 @@ pub unsafe extern "C" fn exception_dispatch(frame: *mut TrapFrame) {
             ));
             usermode::exit_to_kernel(usermode::USER_EXIT_GP, usermode::user_resume_slot());
         }
+        VECTOR_PAGE_FAULT if frame.code_segment & 3 == 3 => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: fatal exception Page Fault vector={} error_code=0x{:016x} instruction_pointer=0x{:016x} in user mode; killing task",
+                frame.vector, frame.error_code, frame.instruction_pointer
+            ));
+            usermode::exit_to_kernel(usermode::USER_EXIT_PF, usermode::user_resume_slot());
+        }
         _ => fatal_handler(frame),
     }
 }

@@ -7,6 +7,7 @@ pub mod heap;
 pub mod idt;
 pub mod interrupts;
 pub mod paging;
+pub mod process;
 pub mod serial;
 pub mod thread;
 pub mod timer;
@@ -80,6 +81,10 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     // covers the image the payloads live in.
     tables.make_identity_user_accessible();
 
+    // Record the kernel tables while they are loaded; every ring-3 exit
+    // restores them.
+    usermode::init(paging::current_root());
+
     thread::init();
     thread::register_heap(&mut heap);
 
@@ -107,18 +112,20 @@ pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
     }
 
     serial::log("Lumora Kernel: boot complete, idling");
-    idle_forever();
+    idle_forever(&mut allocator);
 }
 
 /// Idles the boot thread: logs timer ticks, runs the thread tests once the
-/// timer has proven itself, then the user-mode test, then keeps idling.
-fn idle_forever() -> ! {
+/// timer has proven itself, then the user-mode test, then the process test,
+/// then keeps idling.
+fn idle_forever(frames: &mut frame::FrameAllocator<'_>) -> ! {
     let mut logged_seconds = 0u64;
     let mut timer_pass_logged = false;
     let mut threads_spawned = false;
     let mut spawned_threads = 0usize;
     let mut preemption_logged = false;
     let mut user_test_done = false;
+    let mut process_test_done = false;
     loop {
         // SAFETY: interrupts are enabled before the kernel reaches this loop,
         // so `hlt` only waits for the next timer tick; it touches no memory.
@@ -169,6 +176,10 @@ fn idle_forever() -> ! {
             if preemption_logged && !user_test_done {
                 user_test_done = true;
                 run_user_mode_test();
+            }
+            if user_test_done && !process_test_done {
+                process_test_done = true;
+                run_process_test(frames);
             }
         }
     }
@@ -233,6 +244,138 @@ fn run_user_mode_test() {
         serial::log("Lumora Kernel: user mode test FAIL");
     }
 }
+
+/// Runs the per-process isolation test: two payloads share one user virtual
+/// address in private address spaces, then a third probes kernel memory.
+fn run_process_test(frames: &mut frame::FrameAllocator<'_>) {
+    serial::log("Lumora Kernel: process test starting");
+    let mut isolation_a_ok = false;
+    let mut isolation_b_ok = false;
+    if let Some(a) = process::spawn(payload_iso_a_bytes(), frames) {
+        if process::enter(a, frames) == 0 {
+            isolation_a_ok = true;
+            serial::log("Lumora Kernel: isolation A ok");
+        }
+    }
+    if let Some(b) = process::spawn(payload_iso_b_bytes(), frames) {
+        if process::enter(b, frames) == 0 {
+            isolation_b_ok = true;
+            serial::log("Lumora Kernel: isolation B ok");
+        }
+    }
+    let mut protected = false;
+    if let Some(k) = process::spawn(payload_kernel_read_bytes(), frames) {
+        if process::enter(k, frames) == usermode::USER_EXIT_PF {
+            protected = true;
+            serial::log("Lumora Kernel: kernel memory protected");
+        }
+    }
+    if isolation_a_ok && isolation_b_ok && protected {
+        serial::log("Lumora Kernel: process isolation test PASS");
+    } else {
+        serial::log("Lumora Kernel: process isolation test FAIL");
+    }
+}
+
+/// Bytes of the isolation payloads below, delimited by their start/end
+/// labels. Every payload is position-independent: absolute addresses travel
+/// in registers via `movabs`, and all jumps stay inside the payload.
+macro_rules! payload_bytes {
+    ($start:ident, $end:ident, $bytes:ident) => {
+        unsafe extern "C" {
+            static $start: u8;
+            static $end: u8;
+        }
+
+        fn $bytes() -> &'static [u8] {
+            // SAFETY: the labels delimit read-only image memory emitted by
+            // the matching `global_asm!` block just above.
+            unsafe {
+                let start = &$start as *const u8;
+                let end = &$end as *const u8;
+                core::slice::from_raw_parts(start, end as usize - start as usize)
+            }
+        }
+    };
+}
+
+core::arch::global_asm!(
+    ".global payload_iso_a_start",
+    "payload_iso_a_start:",
+    "movabs rdi, {x}",
+    "movabs rax, 0xAAAAAAAAAAAAAAAA",
+    "mov [rdi], rax",
+    "mov rax, [rdi]",
+    "movabs rdx, 0xAAAAAAAAAAAAAAAA",
+    "cmp rax, rdx",
+    "jne 1f",
+    "mov rax, {exit}",
+    "mov rdi, 0",
+    "int 0x80",
+    "1:",
+    "mov rax, {exit}",
+    "mov rdi, 1",
+    "int 0x80",
+    ".global payload_iso_a_end",
+    "payload_iso_a_end:",
+    x = const process::USER_DATA_VA,
+    exit = const usermode::SYS_EXIT,
+);
+payload_bytes!(payload_iso_a_start, payload_iso_a_end, payload_iso_a_bytes);
+
+core::arch::global_asm!(
+    ".global payload_iso_b_start",
+    "payload_iso_b_start:",
+    "movabs rdi, {x}",
+    "mov rax, [rdi]",
+    "test rax, rax",
+    "jne 1f",
+    "movabs rax, 0xBBBBBBBBBBBBBBBB",
+    "mov [rdi], rax",
+    "mov rax, [rdi]",
+    "movabs rdx, 0xBBBBBBBBBBBBBBBB",
+    "cmp rax, rdx",
+    "jne 2f",
+    "mov rax, {exit}",
+    "mov rdi, 0",
+    "int 0x80",
+    "1:",
+    "mov rax, {exit}",
+    "mov rdi, 1",
+    "int 0x80",
+    "2:",
+    "mov rax, {exit}",
+    "mov rdi, 2",
+    "int 0x80",
+    ".global payload_iso_b_end",
+    "payload_iso_b_end:",
+    x = const process::USER_DATA_VA,
+    exit = const usermode::SYS_EXIT,
+);
+payload_bytes!(payload_iso_b_start, payload_iso_b_end, payload_iso_b_bytes);
+
+core::arch::global_asm!(
+    ".global payload_kernel_read_start",
+    "payload_kernel_read_start:",
+    "movabs rdi, {k}",
+    "mov rax, [rdi]",
+    "mov rax, {exit}",
+    "mov rdi, 1",
+    "int 0x80",
+    ".global payload_kernel_read_end",
+    "payload_kernel_read_end:",
+    k = const KERNEL_PROBE_ADDRESS,
+    exit = const usermode::SYS_EXIT,
+);
+payload_bytes!(
+    payload_kernel_read_start,
+    payload_kernel_read_end,
+    payload_kernel_read_bytes
+);
+
+/// Supervisor-only, mapped kernel address the third payload reads to prove
+/// user mode cannot touch kernel memory.
+const KERNEL_PROBE_ADDRESS: u64 = 0xffff_8000_4000_0000;
 
 /// Exclusive end of the ring-3 stack handed to the user-mode payloads.
 fn user_stack_top() -> u64 {
