@@ -131,11 +131,14 @@ pub fn spawn(entry: fn()) -> Option<usize> {
     Some(id)
 }
 
-/// Switches to the next runnable thread, round robin.
+/// Switches to the next runnable thread, round robin, and reports whether a
+/// switch happened.
 ///
 /// Interrupts are disabled across the switch so a tick cannot land in the
-/// middle of it, then restored to whatever the caller had.
-pub fn yield_now() {
+/// middle of it, then restored to whatever the caller had. Called from thread
+/// code and from the timer handler alike: inside the handler interrupts are
+/// already off, so the restore is correctly skipped there.
+pub fn yield_now() -> bool {
     let interrupts_were_enabled = cpu::interrupts_enabled();
     // SAFETY: interrupts stay off only until the switch below finishes, and
     // the timer handler only counts ticks, so nothing is lost meanwhile.
@@ -143,7 +146,7 @@ pub fn yield_now() {
         cpu::disable_interrupts();
     }
     let current = unsafe { *core::ptr::addr_of!(CURRENT) };
-    if let Some(next) = next_runnable(current) {
+    let switched = if let Some(next) = next_runnable(current) {
         // SAFETY: both slots hold threads: `current` is the running thread and
         // `next` was found by scanning the table. The switch stores this
         // thread's stack pointer in its slot and then loads the other one's.
@@ -152,7 +155,10 @@ pub fn yield_now() {
             core::ptr::write(core::ptr::addr_of_mut!(CURRENT), next);
             context_switch(saved, core::ptr::read(stack_pointer_slot(next)));
         }
-    }
+        true
+    } else {
+        false
+    };
     if interrupts_were_enabled {
         // SAFETY: the switch is complete, and the IDT covers every IRQ the
         // kernel leaves unmasked.
@@ -160,6 +166,7 @@ pub fn yield_now() {
             cpu::enable_interrupts();
         }
     }
+    switched
 }
 
 /// Counts spawned threads whose entry point already returned.
@@ -176,8 +183,12 @@ fn next_free_slot() -> Option<usize> {
 }
 
 /// Finds the next runnable slot after `from`, wrapping around the table.
+///
+/// The scan covers every other slot exactly once and never returns `from`
+/// itself, so a yield with no other runnable thread is a no-op instead of a
+/// switch to a never-saved stack pointer.
 fn next_runnable(from: usize) -> Option<usize> {
-    (1..=MAX_THREADS).find_map(|step| {
+    (1..MAX_THREADS).find_map(|step| {
         let index = (from + step) % MAX_THREADS;
         (unsafe { core::ptr::read(slot(index)).state } == ThreadState::Runnable).then_some(index)
     })
@@ -185,12 +196,15 @@ fn next_runnable(from: usize) -> Option<usize> {
 
 /// Entry point the first context switch into a new thread lands in.
 ///
-/// It calls the thread's entry point and, once that returns, marks the thread
-/// finished and keeps yielding, so control never falls back into the saved
-/// frame. The `2: jmp 2b` tail is unreachable: the last call never returns.
+/// It enables interrupts so the new thread runs preemptible like every other
+/// thread, then calls the thread's entry point and, once that returns, marks
+/// the thread finished and keeps yielding, so control never falls back into
+/// the saved frame. The `2: jmp 2b` tail is unreachable: the last call never
+/// returns.
 #[unsafe(naked)]
 extern "C" fn thread_trampoline() {
     core::arch::naked_asm!(
+        "sti",
         "sub rsp, 32",
         "call {run}",
         "add rsp, 32",
@@ -250,9 +264,9 @@ unsafe extern "C" fn finish_current_entry() -> ! {
 ///
 /// # Safety
 ///
-/// `saved` must point at the running thread's stack-pointer slot and
-/// `next_stack_pointer` must be a stack pointer stored by an earlier call
-/// on a thread that is still alive.
+/// `saved` must point at the running thread's stack-pointer slot, and
+/// `next_stack_pointer` must be a stack pointer stored by an earlier call on
+/// a thread that is still alive.
 #[unsafe(naked)]
 unsafe extern "C" fn context_switch(saved: *mut u64, next_stack_pointer: u64) {
     core::arch::naked_asm!(
@@ -301,7 +315,7 @@ impl Thread {
 /// nothing else reads or writes that slot, which holds for the running thread
 /// whenever it holds the call.
 unsafe fn slot(index: usize) -> *mut Thread {
-    core::ptr::addr_of_mut!(THREADS).cast::<Thread>().add(index)
+    unsafe { core::ptr::addr_of_mut!(THREADS).cast::<Thread>().add(index) }
 }
 
 /// Address of the saved stack pointer stored in slot `index`.
@@ -311,5 +325,5 @@ unsafe fn slot(index: usize) -> *mut Thread {
 /// `index` must be inside the table and hold a live thread, because the
 /// context switch writes the current thread's stack pointer through it.
 unsafe fn stack_pointer_slot(index: usize) -> *mut u64 {
-    core::ptr::addr_of_mut!((*slot(index)).stack_pointer)
+    unsafe { core::ptr::addr_of_mut!((*slot(index)).stack_pointer) }
 }

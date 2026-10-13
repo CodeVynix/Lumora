@@ -3,10 +3,14 @@
 //! The two 8259 PICs are remapped so hardware IRQs arrive on vectors 32-47
 //! instead of colliding with CPU exceptions, and every IRQ except the timer
 //! (IRQ0) is masked. PIT channel 0 runs as a rate generator at 100 Hz, and
-//! each IRQ0 increments an atomic tick counter. A local APIC timer will
-//! replace this hardware later; the counter API stays the same.
+//! each IRQ0 increments an atomic tick counter. Every tenth tick ends the
+//! running thread's time slice by switching to the next runnable thread. A
+//! local APIC timer will replace this hardware later; the counter API stays
+//! the same.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::thread;
 
 /// PIT input clock in hertz (standard PC value).
 const PIT_INPUT_HZ: u32 = 1_193_182;
@@ -14,6 +18,8 @@ const PIT_INPUT_HZ: u32 = 1_193_182;
 const TIMER_HZ: u32 = 100;
 /// Ticks per logged second.
 pub const TICKS_PER_SECOND: u64 = TIMER_HZ as u64;
+/// Ticks per preemptive time slice: 10 ticks at 100 Hz is 100 ms.
+const TIME_SLICE_TICKS: u64 = 10;
 /// PIT divisor for 100 Hz (1193182 / 100, truncated).
 const PIT_DIVISOR: u16 = (PIT_INPUT_HZ / TIMER_HZ) as u16;
 
@@ -33,6 +39,9 @@ const PIT_COMMAND: u16 = 0x43;
 /// Ticks elapsed since the timer was programmed.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Timer-triggered context switches so far.
+static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Remaps the PICs, masks everything but IRQ0, and starts the 100 Hz timer.
 ///
 /// Call this after the IDT is loaded and before enabling interrupts, so the
@@ -42,18 +51,30 @@ pub fn init() {
     program_pit();
 }
 
-/// Records one timer tick and acknowledges IRQ0.
+/// Records one timer tick, acknowledges IRQ0, and ends the running thread's
+/// time slice every tenth tick.
 ///
-/// This runs inside the timer interrupt handler, so it only touches an atomic
-/// counter and the PIC command port: it never prints and never takes a lock.
+/// This runs inside the timer interrupt handler, so it only touches atomic
+/// counters and the PIC command port: it never prints, never allocates, and
+/// never takes a lock.
 pub fn tick() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     send_eoi();
+    // The EOI above already went out, so the PIC keeps delivering ticks no
+    // matter which thread resumes below.
+    if ticks.is_multiple_of(TIME_SLICE_TICKS) && thread::yield_now() {
+        PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Ticks elapsed since [`init`] programmed the timer.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Timer-triggered context switches so far.
+pub fn preemptions() -> u64 {
+    PREEMPTIONS.load(Ordering::Relaxed)
 }
 
 /// Remaps IRQs 0-15 to vectors 32-47 and masks every IRQ except IRQ0.
