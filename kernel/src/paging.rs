@@ -66,11 +66,100 @@ impl PageTable {
         let virtual_address = self.next_virtual;
         Some(virtual_address)
     }
+
+    /// Marks the first-gigabyte identity mapping user-accessible so ring-3
+    /// code can run from the low image pages.
+    ///
+    /// shortcut: the whole low gigabyte becomes user-accessible instead of
+    /// only the user payload pages; upgrade to per-process page tables when
+    /// the process model needs real isolation.
+    pub fn make_identity_user_accessible(&mut self) {
+        // SAFETY: the table addresses below come from this page table's own
+        // entries, so they are live frames, and the identity map keeps them
+        // writable; reloading CR3 flushes stale supervisor-only translations.
+        unsafe {
+            let root = self.root;
+            let pml4e = read_entry(root, 0);
+            let pdpt = pml4e & !0xFFF;
+            write_entry(root, 0, pml4e | USER);
+            let pdpte = read_entry(pdpt, 0);
+            write_entry(pdpt, 0, pdpte | USER);
+            let pd = pdpte & !0xFFF;
+            for index in 0..512usize {
+                write_entry(pd, index, read_entry(pd, index) | USER);
+            }
+            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+        }
+    }
 }
 
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;
+const USER: u64 = 1 << 2;
 const HUGE: u64 = 1 << 7;
+
+/// Returns true when every byte in `[start, start + len)` is present and
+/// user-accessible in the currently loaded page tables.
+pub fn is_user_range(start: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) => end,
+        None => return false,
+    };
+    if !is_canonical(start) || !is_canonical(end - 1) {
+        return false;
+    }
+    let mut page = start & !0xFFF;
+    loop {
+        if !is_user_page(page) {
+            return false;
+        }
+        match page.checked_add(0x1000) {
+            Some(next) if next < end => page = next,
+            _ => break,
+        }
+    }
+    true
+}
+
+/// Returns true when the page containing `address` is present and
+/// user-accessible in the currently loaded page tables.
+fn is_user_page(address: u64) -> bool {
+    // Every table address below is read back out of a live entry of the
+    // current page tables, and page-table memory stays mapped.
+    let root = read_cr3() & !0xFFF;
+    let pml4e = read_entry(root, ((address >> 39) & 0x1FF) as usize);
+    if pml4e & (PRESENT | USER) != (PRESENT | USER) {
+        return false;
+    }
+    let pdpt = pml4e & !0xFFF;
+    let pdpte = read_entry(pdpt, ((address >> 30) & 0x1FF) as usize);
+    if pdpte & (PRESENT | USER) != (PRESENT | USER) {
+        return false;
+    }
+    if pdpte & HUGE != 0 {
+        return true;
+    }
+    let pd = pdpte & !0xFFF;
+    let pde = read_entry(pd, ((address >> 21) & 0x1FF) as usize);
+    if pde & (PRESENT | USER) != (PRESENT | USER) {
+        return false;
+    }
+    if pde & HUGE != 0 {
+        return true;
+    }
+    let pt = pde & !0xFFF;
+    let pte = read_entry(pt, ((address >> 12) & 0x1FF) as usize);
+    pte & (PRESENT | USER) == (PRESENT | USER)
+}
+
+/// Returns true for canonical 64-bit addresses, whose top 16 bits are all
+/// clear or all set (Intel SDM Vol. 3, section 3.3.7.1).
+fn is_canonical(address: u64) -> bool {
+    address >> 47 == 0 || address >> 47 == 0x1FFFF
+}
 
 fn zero_table(physical: u64) {
     // SAFETY: the frame allocator returns aligned, usable physical frames and
@@ -78,6 +167,12 @@ fn zero_table(physical: u64) {
     unsafe {
         core::ptr::write_bytes(physical as *mut u64, 0, 512);
     }
+}
+
+fn read_entry(table: u64, index: usize) -> u64 {
+    // SAFETY: `table` is a page-table frame owned by a live `PageTable` and
+    // `index` is bounded to the 512 entries in that frame.
+    unsafe { core::ptr::read((table as *const u64).add(index)) }
 }
 
 fn write_entry(table: u64, index: usize, value: u64) {
@@ -94,4 +189,13 @@ fn load_root(root: u64) {
     unsafe {
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
     }
+}
+
+fn read_cr3() -> u64 {
+    let root: u64;
+    // SAFETY: reading CR3 only reports the active root and changes nothing.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags));
+    }
+    root
 }
