@@ -1,9 +1,10 @@
 # Threads
 
-Build 1 step 3, part C adds cooperative kernel threads. Threads never preempt
-each other: the timer interrupt only counts ticks (see `timer.md`) and never
-switches, so a thread runs until it calls `yield_now()`. `kernel/src/thread.rs`
-owns everything below.
+Build 1 step 3, part C adds kernel threads with a cooperative context switch,
+and part D makes the scheduler preemptive: every tenth timer tick ends the
+running thread's time slice (see `timer.md`). Threads still yield voluntarily
+with `yield_now()`, and the timer preempts threads that never yield.
+`kernel/src/thread.rs` owns everything below.
 
 ## Thread table
 
@@ -43,17 +44,40 @@ first argument travels in `rcx` and the second in `rdx`; that ABI also makes
 System V list would stop at `rbx`, `rbp`, and `r12`-`r15`.
 
 The first switch into a spawned thread pops eight zeroed registers and returns
-into `thread_trampoline`, which allocates the shadow space the ABI requires,
-calls the thread's entry point, and then marks the thread finished and keeps
-yielding. Nothing ever falls back into the saved frame.
+into `thread_trampoline`, which enables interrupts so the new thread runs
+preemptible like every other thread, allocates the shadow space the ABI
+requires, calls the thread's entry point, and then marks the thread finished
+and keeps yielding. Nothing ever falls back into the saved frame.
 
 ## Yield
 
 `yield_now` finds the next runnable slot after the current one, wrapping
-around the table, disables interrupts, switches, and restores the interrupt
-flag to whatever the interrupted thread had. `next_runnable` never selects the
-current thread, so a yield with no other runnable thread is a no-op.
+around the table but never returning the current slot itself: switching to a
+thread whose stack pointer was never saved would load garbage. It disables
+interrupts, switches, restores the interrupt flag to whatever the caller had,
+and reports whether a switch happened. A yield with no other runnable thread
+is a no-op.
 
-The boot thread's loop yields once the timer test has passed; it logs
-`thread test PASS` once both spawned threads are finished and then keeps
-idling and logging ticks as before.
+The same function serves voluntary yields from thread code and preemption
+from the timer handler. Inside the handler interrupts are already off, so the
+restore is correctly skipped there; when the preempted thread resumes later,
+its own `yield_now` frame restores the flag it had.
+
+## Preemption
+
+Every tenth tick ends the running thread's 100 ms slice: the handler sends
+EOI first so the PIC keeps delivering ticks, then asks the round robin for
+the next thread. A global atomic counter records each timer-triggered switch;
+it only counts switches that actually happen, never bare slice expiries with
+nothing else runnable.
+
+Two rules keep preemption sound. First, every thread runs with interrupts
+enabled: the trampoline executes `sti` before a new thread's entry point, and
+`yield_now` restores the caller's flag after every switch. Second, serial
+logging disables interrupts for the duration of each log call, so a tick can
+never preempt a thread in the middle of a line; the timer handler itself never
+logs.
+
+The boot thread's loop yields once the timer test has passed; once both
+spawned threads are finished it logs the preemption count and the preemption
+test result, then keeps idling and logging ticks as before.
