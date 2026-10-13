@@ -174,8 +174,9 @@ fn idle_forever() -> ! {
     }
 }
 
-/// Runs the two ring-3 payloads and logs `user mode test PASS` only when the
-/// first exits cleanly and the second dies by general protection fault.
+/// Runs the three ring-3 payloads and logs `user mode test PASS` only when the
+/// first exits cleanly, the second dies by general protection fault, and the
+/// third sees every hostile pointer rejected.
 fn run_user_mode_test() {
     serial::log("Lumora Kernel: user mode test starting");
     // SAFETY: the user segments are loaded, TSS RSP0 points at the ring-0
@@ -193,6 +194,11 @@ fn run_user_mode_test() {
     unsafe {
         cpu::enable_interrupts();
     }
+    let mut payload1_ok = false;
+    if write_code == usermode::USER_EXIT_OK {
+        payload1_ok = true;
+        serial::log("Lumora Kernel: user payload 1 exited cleanly");
+    }
     // SAFETY: same ring-3 preconditions as the first payload.
     let privileged_code = unsafe {
         usermode::enter_user(
@@ -206,7 +212,22 @@ fn run_user_mode_test() {
     unsafe {
         cpu::enable_interrupts();
     }
-    if write_code == usermode::USER_EXIT_OK && privileged_code == usermode::USER_EXIT_GP {
+    let payload2_killed = privileged_code == usermode::USER_EXIT_GP;
+    // SAFETY: same ring-3 preconditions as the first payload.
+    let hostile_code = unsafe {
+        usermode::enter_user(
+            user_payload_hostile as *const () as usize as u64,
+            user_stack_top(),
+            usermode::user_resume_slot(),
+        )
+    };
+    // SAFETY: the syscall exit path abandons its interrupt frame without
+    // restoring flags, so interrupts stay off until re-enabled here.
+    unsafe {
+        cpu::enable_interrupts();
+    }
+    let payload3_ok = hostile_code == usermode::USER_EXIT_OK;
+    if payload1_ok && payload2_killed && payload3_ok {
         serial::log("Lumora Kernel: user mode test PASS");
     } else {
         serial::log("Lumora Kernel: user mode test FAIL");
@@ -221,22 +242,61 @@ fn user_stack_top() -> u64 {
 /// Ring-3 test payload: writes one message with a syscall, then exits.
 fn user_payload_write() {
     let message = USER_HELLO;
+    let _ = syscall_write(message.as_ptr() as u64, message.len() as u64);
+    syscall_exit(usermode::USER_EXIT_OK);
+}
+
+/// Performs the write syscall from ring 3 and returns the kernel's result.
+fn syscall_write(pointer: u64, length: u64) -> u64 {
+    let result: u64;
     // SAFETY: `int 0x80` is the installed syscall gate, which is callable
-    // from ring 3; the pointer and length name the static message above.
+    // from ring 3; the kernel validates the pointer and length before use.
     unsafe {
         core::arch::asm!(
             "int 0x80",
             in("rax") usermode::SYS_WRITE_SERIAL,
-            in("rdi") message.as_ptr() as u64,
-            in("rsi") message.len() as u64,
-            lateout("rax") _,
+            in("rdi") pointer,
+            in("rsi") length,
+            lateout("rax") result,
         );
+    }
+    result
+}
+
+/// Exits the ring-3 task with `code`; never returns.
+fn syscall_exit(code: u64) -> ! {
+    // SAFETY: `int 0x80` is the installed syscall gate, and the exit path
+    // resumes the kernel instead of returning to the caller.
+    unsafe {
         core::arch::asm!(
             "int 0x80",
             in("rax") usermode::SYS_EXIT,
-            in("rdi") usermode::USER_EXIT_OK,
+            in("rdi") code,
             options(noreturn),
         );
+    }
+}
+
+/// Ring-3 test payload: feeds the write syscall three hostile arguments and
+/// exits cleanly only if the kernel rejects every one of them.
+fn user_payload_hostile() {
+    let mut rejected = 0u32;
+    // Supervisor-only kernel heap page with a valid-looking length.
+    if syscall_write(0xffff_8000_4000_0000, 16) == u64::MAX {
+        rejected += 1;
+    }
+    // Length that wraps the range past the end of the address space.
+    if syscall_write(0x1000, u64::MAX) == u64::MAX {
+        rejected += 1;
+    }
+    // Range straddling the end of the user-accessible low region.
+    if syscall_write(0x3FFF_F000, 0x2000) == u64::MAX {
+        rejected += 1;
+    }
+    if rejected == 3 {
+        syscall_exit(usermode::USER_EXIT_OK);
+    } else {
+        syscall_exit(1);
     }
 }
 
