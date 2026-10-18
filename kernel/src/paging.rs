@@ -96,7 +96,7 @@ impl PageTable {
 pub(crate) const PRESENT: u64 = 1;
 pub(crate) const WRITABLE: u64 = 1 << 1;
 pub(crate) const USER: u64 = 1 << 2;
-const HUGE: u64 = 1 << 7;
+pub(crate) const HUGE: u64 = 1 << 7;
 
 /// Root of the currently loaded page tables, with flags masked off.
 pub fn current_root() -> u64 {
