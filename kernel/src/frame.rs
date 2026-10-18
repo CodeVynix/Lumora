@@ -37,6 +37,9 @@ impl<'a> FrameAllocator<'a> {
     pub fn allocate(&mut self) -> Option<u64> {
         if self.freed_count > 0 {
             self.freed_count -= 1;
+            // A recycled frame leaves the pool just like a fresh one, so the
+            // count stays exact across allocate/free round trips.
+            self.remaining = self.remaining.saturating_sub(1);
             return Some(self.freed[self.freed_count]);
         }
         loop {
