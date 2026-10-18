@@ -18,7 +18,36 @@ fn main() -> ExitCode {
     }
 }
 
+fn build_hello() -> bool {
+    let mut script = PathBuf::from("apps");
+    script.push("hello");
+    script.push("link.ld");
+    let rustflags = format!(
+        "-C link-arg=-T{} -C relocation-model=static -C code-model=large",
+        script.display()
+    );
+    match Command::new("cargo")
+        .args(["build", "-p", "hello", "--target", "x86_64-unknown-none"])
+        .env("RUSTFLAGS", rustflags)
+        .status()
+    {
+        Ok(status) => {
+            if !status.success() {
+                eprintln!("hello user program failed to build");
+            }
+            status.success()
+        }
+        Err(error) => {
+            eprintln!("failed to build hello: {error}");
+            false
+        }
+    }
+}
+
 fn build(exception_test: bool) -> ExitCode {
+    if !build_hello() {
+        return ExitCode::from(1);
+    }
     if !command("cargo", &["test", "-p", "lumora-kernel"]) {
         return ExitCode::from(1);
     }
