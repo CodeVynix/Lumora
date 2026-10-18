@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod cpu;
+pub mod elf;
 pub mod frame;
 pub mod gdt;
 pub mod heap;
@@ -38,6 +39,12 @@ struct AlignedUserStack([u8; USER_STACK_BYTES]);
 
 /// Stack the kernel hands to the ring-3 test payloads on entry.
 static mut USER_STACK: AlignedUserStack = AlignedUserStack([0; USER_STACK_BYTES]);
+
+/// Bytes of the hello user program built by xtask for the ELF loader test.
+static HELLO_ELF: &[u8] = include_bytes!("../../target/x86_64-unknown-none/debug/hello");
+
+/// Scratch space for building hostile ELF images, reused for every case.
+static mut ELF_SCRATCH: [u8; 16384] = [0; 16384];
 
 /// Kernel entry called by the bootloader after the UEFI handoff.
 pub fn kernel_entry(memory_map: &[MemoryRegion]) -> BootReport {
@@ -126,6 +133,7 @@ fn idle_forever(frames: &mut frame::FrameAllocator<'_>) -> ! {
     let mut preemption_logged = false;
     let mut user_test_done = false;
     let mut process_test_done = false;
+    let mut elf_test_done = false;
     loop {
         // SAFETY: interrupts are enabled before the kernel reaches this loop,
         // so `hlt` only waits for the next timer tick; it touches no memory.
@@ -180,6 +188,10 @@ fn idle_forever(frames: &mut frame::FrameAllocator<'_>) -> ! {
             if user_test_done && !process_test_done {
                 process_test_done = true;
                 run_process_test(frames);
+            }
+            if process_test_done && !elf_test_done {
+                elf_test_done = true;
+                run_elf_test(frames);
             }
         }
     }
@@ -274,6 +286,266 @@ fn run_process_test(frames: &mut frame::FrameAllocator<'_>) {
         serial::log("Lumora Kernel: process isolation test PASS");
     } else {
         serial::log("Lumora Kernel: process isolation test FAIL");
+    }
+}
+
+/// Runs the ELF loader test: a real program from ELF bytes, ten hostile
+/// images that must all be rejected, and a frame-leak check around all of it.
+fn run_elf_test(frames: &mut frame::FrameAllocator<'_>) {
+    serial::log("Lumora Kernel: ELF loader test starting");
+    let before = frames.free_frames();
+    let mut good_ok = false;
+    match elf::validate(HELLO_ELF) {
+        Ok(image) => {
+            if let Some(id) = process::spawn_elf(&image, HELLO_ELF, frames) {
+                let code = process::enter_elf(id, frames);
+                log_process_outcome(id, code);
+                good_ok = code == 0;
+            }
+        }
+        Err(error) => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: hostile ELF rejected: {}",
+                error.reason()
+            ));
+        }
+    }
+    let mut hostile_ok = 0u32;
+    // SAFETY: the scratch buffer is only touched here, one case at a time,
+    // and every case below bounds its copy by both lengths first.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(ELF_SCRATCH) };
+    if hostile_case(scratch, HELLO_ELF, "bad magic", HELLO_ELF.len(), |bytes| {
+        bytes[0] = 0x00;
+    }) {
+        hostile_ok += 1;
+    }
+    if hostile_case(scratch, HELLO_ELF, "truncated file", 32, |_| {}) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "program header table past end of file",
+        HELLO_ELF.len(),
+        |bytes| {
+            write_u64(bytes, 32, HELLO_ELF.len() as u64 + 0x100);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "segment past end of file",
+        HELLO_ELF.len(),
+        |bytes| {
+            let table = read_u64(HELLO_ELF, 32) as usize;
+            write_u64(bytes, table + 8, HELLO_ELF.len() as u64);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "filesz exceeds memsz",
+        HELLO_ELF.len(),
+        |bytes| {
+            let table = read_u64(HELLO_ELF, 32) as usize;
+            let memsz = read_u64(HELLO_ELF, table + 40);
+            write_u64(bytes, table + 32, memsz + 1);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "segment outside user range",
+        HELLO_ELF.len(),
+        |bytes| {
+            let table = read_u64(HELLO_ELF, 32) as usize;
+            write_u64(bytes, table + 16, 0xffff_8000_4000_0000);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "address range overflow",
+        HELLO_ELF.len(),
+        |bytes| {
+            let table = read_u64(HELLO_ELF, 32) as usize;
+            write_u64(bytes, table + 16, u64::MAX - 0xFFF);
+            write_u64(bytes, table + 40, 0x2000);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "writable and executable segment",
+        HELLO_ELF.len(),
+        |bytes| {
+            let table = read_u64(HELLO_ELF, 32) as usize;
+            write_u64(bytes, table + 4, 7);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_case(
+        scratch,
+        HELLO_ELF,
+        "entry point outside any segment",
+        HELLO_ELF.len(),
+        |bytes| {
+            write_u64(bytes, 24, 0x80_1000_0000);
+        },
+    ) {
+        hostile_ok += 1;
+    }
+    if hostile_too_many(scratch) {
+        hostile_ok += 1;
+    }
+    let after = frames.free_frames();
+    serial::log_args(format_args!(
+        "Lumora Kernel: frames before {} after {}",
+        before, after
+    ));
+    if good_ok && hostile_ok == 10 && before == after {
+        serial::log("Lumora Kernel: ELF loader test PASS");
+    } else {
+        serial::log("Lumora Kernel: ELF loader test FAIL");
+    }
+}
+
+/// Builds an image with nine loadable headers by splicing six extra ones
+/// after the hello program's own table, then checks it is rejected for
+/// having too many segments. The count check fires before any segment is
+/// inspected, so the filler headers only need the loadable type.
+fn hostile_too_many(scratch: &mut [u8]) -> bool {
+    let table = read_u64(HELLO_ELF, 32) as usize;
+    let count = read_u16(HELLO_ELF, 56) as usize;
+    // One more loadable header than the loader accepts.
+    const EXTRA_HEADERS: usize = elf::MAX_LOAD_SEGMENTS - 2 + 1;
+    const HEADER_SIZE: usize = 56;
+    let total = HELLO_ELF.len();
+    let table_end = table + count * HEADER_SIZE;
+    let extra_end = table_end + EXTRA_HEADERS * HEADER_SIZE;
+    // The program header table sits in the padding ahead of the first segment,
+    // so the extra headers fit without moving any file data or real headers.
+    if total > scratch.len() || table_end > total || extra_end > total {
+        return false;
+    }
+    scratch[..total].copy_from_slice(HELLO_ELF);
+    for extra in 0..EXTRA_HEADERS {
+        let entry = table_end + extra * HEADER_SIZE;
+        scratch[entry..entry + HEADER_SIZE].fill(0);
+        write_u32(scratch, entry, 1);
+    }
+    write_u16(&mut scratch[..], 56, (count + EXTRA_HEADERS) as u16);
+    match elf::validate(&scratch[..total]) {
+        Err(error) if error.reason() == "too many segments" => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: hostile ELF rejected: {}",
+                error.reason()
+            ));
+            true
+        }
+        Err(error) => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: hostile ELF rejected with wrong reason: {}",
+                error.reason()
+            ));
+            false
+        }
+        Ok(_) => false,
+    }
+}
+
+/// Logs how process `id` ended: a clean exit code or the fatal signal.
+fn log_process_outcome(id: usize, code: u64) {
+    match code {
+        usermode::USER_EXIT_GP => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: process {} killed: general protection fault",
+                id
+            ));
+        }
+        usermode::USER_EXIT_PF => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: process {} killed: page fault",
+                id
+            ));
+        }
+        _ => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: process {} exited with code {}",
+                id, code
+            ));
+        }
+    }
+}
+
+/// Reads a little-endian `u16` at `offset`; the caller bounds-checks first.
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    let mut pair = [0u8; 2];
+    pair.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(pair)
+}
+
+/// Reads a little-endian `u64` at `offset`; the caller bounds-checks first.
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut oct = [0u8; 8];
+    oct.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(oct)
+}
+
+/// Writes `value` little-endian at `offset`; the caller bounds-checks first.
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Writes `value` little-endian at `offset`; the caller bounds-checks first.
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Writes `value` little-endian at `offset`; the caller bounds-checks first.
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Copies `len` bytes of `hello` into scratch, applies `patch`, and checks
+/// validation fails with `expected`, logging the rejection.
+fn hostile_case(
+    scratch: &mut [u8],
+    hello: &[u8],
+    expected: &str,
+    len: usize,
+    patch: impl FnOnce(&mut [u8]),
+) -> bool {
+    let len = len.min(scratch.len()).min(hello.len());
+    scratch[..len].copy_from_slice(&hello[..len]);
+    patch(&mut scratch[..len]);
+    match elf::validate(&scratch[..len]) {
+        Err(error) if error.reason() == expected => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: hostile ELF rejected: {}",
+                error.reason()
+            ));
+            true
+        }
+        Err(error) => {
+            serial::log_args(format_args!(
+                "Lumora Kernel: hostile ELF rejected with wrong reason: {}",
+                error.reason()
+            ));
+            false
+        }
+        Ok(_) => false,
     }
 }
 
