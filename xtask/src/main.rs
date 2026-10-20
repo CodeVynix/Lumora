@@ -92,6 +92,15 @@ fn run(exception_test: bool) -> ExitCode {
         eprintln!("failed to copy writable OVMF variables: {error}");
         return ExitCode::from(1);
     }
+    let disk = PathBuf::from("target/lumora-disk.img");
+    if !disk.exists() {
+        let size = 8 * 1024 * 1024;
+        let data = vec![0u8; size];
+        if let Err(error) = fs::write(&disk, &data) {
+            eprintln!("failed to create disk image: {error}");
+            return ExitCode::from(1);
+        }
+    }
     if !command(
         "qemu-system-x86_64",
         &[
@@ -103,6 +112,10 @@ fn run(exception_test: bool) -> ExitCode {
             "if=pflash,format=raw,file=target/OVMF_VARS_4M.fd",
             "-drive",
             "format=raw,file=fat:rw:target/lumora-esp",
+            "-drive",
+            "file=target/lumora-disk.img,if=none,format=raw,id=disk0",
+            "-device",
+            "virtio-blk-pci,drive=disk0",
             "-nographic",
             "-serial",
             "stdio",
