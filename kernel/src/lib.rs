@@ -8,6 +8,7 @@ pub mod heap;
 pub mod idt;
 pub mod interrupts;
 pub mod paging;
+pub mod pci;
 pub mod process;
 pub mod serial;
 pub mod thread;
@@ -134,6 +135,7 @@ fn idle_forever(frames: &mut frame::FrameAllocator<'_>) -> ! {
     let mut user_test_done = false;
     let mut process_test_done = false;
     let mut elf_test_done = false;
+    let mut pci_test_done = false;
     loop {
         // SAFETY: interrupts are enabled before the kernel reaches this loop,
         // so `hlt` only waits for the next timer tick; it touches no memory.
@@ -193,7 +195,22 @@ fn idle_forever(frames: &mut frame::FrameAllocator<'_>) -> ! {
                 elf_test_done = true;
                 run_elf_test(frames);
             }
+            if elf_test_done && !pci_test_done {
+                pci_test_done = true;
+                run_pci_test();
+            }
         }
+    }
+}
+
+/// Enumerates PCI and logs PASS only if a virtio-blk device is found.
+fn run_pci_test() {
+    serial::log("Lumora Kernel: PCI test starting");
+    pci::enumerate();
+    if pci::virtio_blk_location().is_some() {
+        serial::log("Lumora Kernel: PCI test PASS");
+    } else {
+        serial::log("Lumora Kernel: PCI test FAIL");
     }
 }
 
